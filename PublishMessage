@@ -1,0 +1,241 @@
+
+expose one service in integ node so ESB can use white list ESB IP in WAF so it can be accessible to that IP only
+
+https://api.uat.cssp.portal.conduent.com/external-new/provider
+
+in APIM:
+
+https://apiprod.cssp.portal.conduent.com/external-new/provider
+
+
+InBound Policies:
+
+<!--
+    IMPORTANT:
+    - Policy elements can appear only within the <inbound>, <outbound>, <backend> section elements.
+    - To apply a policy to the incoming request (before it is forwarded to the backend service), place a corresponding policy element within the <inbound> section element.
+    - To apply a policy to the outgoing response (before it is sent back to the caller), place a corresponding policy element within the <outbound> section element.
+    - To add a policy, place the cursor at the desired insertion point and select a policy from the sidebar.
+    - To remove a policy, delete the corresponding policy statement from the policy document.
+    - Position the <base> element within a section element to inherit all policies from the corresponding section element in the enclosing scope.
+    - Remove the <base> element to prevent inheriting policies from the corresponding section element in the enclosing scope.
+    - Policies are applied in the order of their appearance, from the top down.
+    - Comments within policy elements are not supported and may disappear. Place your comments between policy elements or at a higher level scope.
+-->
+<policies>
+    <inbound>
+        <base />
+        <find-and-replace from="soap:body" to="soap:Body" />
+        <set-header name="certIndicator" exists-action="override">
+            <value>@{
+                    String indata = context.Request.Body.As<string>(preserveContent: true);
+                    try
+                    {
+                    XmlDocument inDocument = new XmlDocument();
+                    inDocument.LoadXml(indata);
+                    XmlNodeList elemList = inDocument.DocumentElement.GetElementsByTagName("X509Certificate","*");  
+                     foreach (XmlNode certval in elemList)
+                     {      
+                        if (certval.InnerText !="")
+                        {
+                            String certData = certval.InnerText;
+                            byte[] certbyte = Encoding.ASCII.GetBytes(certData);
+                            var incomingcert = new X509Certificate2(certbyte); 
+                            if (incomingcert.NotAfter <= DateTime.Now)
+                            {
+                                return "Expired";
+                            }
+                            
+                            return "Valid";
+                        }
+                     }   
+                    return "NoCert";
+                    }
+                    catch (Exception ex)
+                    {
+                        return ex.ToString();
+                    }
+                    }</value>
+        </set-header>
+        <set-header name="serviceID" exists-action="override">
+            <value>@{
+                    String indata = context.Request.Body.As<string>(preserveContent: true);
+                    try
+                    {
+                    XmlDocument inDocument = new XmlDocument();
+                    inDocument.LoadXml(indata);
+                    XmlNodeList elemList = inDocument.DocumentElement.GetElementsByTagName("Action","*");  
+                     foreach (XmlNode servval in elemList)
+                     {      
+                        if (servval.InnerText !="")
+                        {
+                            String serviceid = servval.InnerText;
+                           
+                            return serviceid;
+                        }
+                     }   
+                    return "NoService";
+                    }
+                    catch (Exception ex)
+                    {
+                        return ex.ToString();
+                    }
+                    }</value>
+        </set-header>
+        <choose>
+            <when condition="@(!(context.Request.Headers.GetValueOrDefault("certIndicator", "") == "Valid"))">
+                <set-variable name="certReason" value="@(context.Request.Headers.GetValueOrDefault("certIndicator", ""))" />
+                <return-response>
+                    <set-status code="403" reason="Unauthorized Request" />
+                </return-response>
+            </when>
+            <when condition="@(context.Request.Headers.GetValueOrDefault("serviceID", "") == "CWPGetAccountInfo")">
+                <set-backend-service base-url="http://10.142.165.138" />
+                <rewrite-uri template="/nodeIntegration/internal/getAccountInfo" copy-unmatched-params="false" />
+            </when>
+            <when condition="@(context.Request.Headers.GetValueOrDefault("serviceID", "") == "CWPManualAuthentication")">
+                <set-backend-service base-url="http://10.142.165.138" />
+                <rewrite-uri template="/nodeIntegration/internal/manualAuthentication" copy-unmatched-params="false" />
+            </when>
+            <when condition="@(context.Request.Headers.GetValueOrDefault("serviceID", "") == "CWPMessageToCWP")">
+                <set-backend-service base-url="http://10.142.165.138" />
+                <rewrite-uri template="/nodeIntegration/internal/publishMessageToCWP" copy-unmatched-params="false" />
+                <!--<rewrite-uri template="/nodeIntegration/internal/messageToCWP" copy-unmatched-params="false" />-->
+            </when>
+            <otherwise>
+                <set-variable name="serviceID" value="@(context.Request.Headers.GetValueOrDefault("serviceID", ""))" />
+                <return-response>
+                    <set-status code="403" reason="Invalid serviceID" />
+                </return-response>
+            </otherwise>
+        </choose>
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>
+
+Code:
+
+
+import { v4 as uuidv4 } from 'uuid';
+import { Request, Response, NextFunction } from 'express';
+import { config } from '../../config/main'
+var { auditCacheConnection } = require("../../cache/auditCache");
+
+enum MessageState {
+  Pending = "pending",
+  Processing = "processing",
+  Completed = "completed",
+  Failed = "failed"
+}
+
+let channel = config.auditCacheChannelName
+
+interface Message {
+  content: string;
+  state: MessageState;
+}
+
+// Publisher
+async function publishMessage(req: any, res: any, channel: any, message: any) {
+  try {
+
+    auditCacheConnection && await auditCacheConnection.publish(channel, message)
+    
+  } catch (error) {
+    req.app.settings.apiLogger.error({
+      message: "Logging Exception in publishToAudit - ",
+      error,
+    });
+  }
+}
+
+const publishMessageToCWP = async (req: any, res: any, transactionParams: any) => {
+
+  let requestBody = (req as any).rawBody;
+
+  const messageDetails: Message = {
+    content: requestBody,
+    state: MessageState.Pending,
+  };
+
+  try {
+    const messageKey = `${config.auditCacheEnvironment}-messgetocwp:${Date.now()}`;
+    auditCacheConnection && await auditCacheConnection.set(messageKey, JSON.stringify(messageDetails));
+
+    await publishMessage(req, res, channel, messageKey);
+
+    let nDate: any = new Date().toISOString();
+
+    let resultXML = `<?xml version='1.0' encoding='UTF-8' ?>
+                <soapenv:Envelope xmlns:soapenv="http://www.w3.org/2003/05/soap-envelope">
+                    <soapenv:Header xmlns:wsa="http://www.w3.org/2005/08/addressing">
+                        <wsa:Action>CWPMessageToCWP</wsa:Action>
+                    </soapenv:Header>
+                <soapenv:Body>
+                    <mes:MessageToCWPResponse xmlns:mes="http://hhstp.ms.gov/hhstp/MessageToCWP" xmlns:ns="http://hhstp.ms.gov/hhstp/hhstp-core/1.0">
+                        <ns:ResponseCode>200</ns:ResponseCode>
+                        <ns:ResponseDescription>Message is received</ns:ResponseDescription>
+                        <ns:ResponseTimeStamp>${nDate}</ns:ResponseTimeStamp>
+                    </mes:MessageToCWPResponse>
+                </soapenv:Body>
+            </soapenv:Envelope>`
+    
+    await res.contentType("application/xml");
+    await res.send(resultXML)
+
+    // res.send({
+    //   ResponseCode: "200",
+    //   ResponseDescription: "Request sent successfully",
+    //   ResponseTimeStamp: new Date()
+    // })
+    
+  } catch (error) {
+    req.app.settings.apiLogger.error({
+      message: "Logging Exception in publishToAudit - ",
+      error,
+    });
+
+    let nDate: any = new Date().toISOString();
+
+    let resultXML = `<?xml version='1.0' encoding='UTF-8' ?>
+                <soapenv:Envelope xmlns:soapenv="http://www.w3.org/2003/05/soap-envelope">
+                    <soapenv:Header xmlns:wsa="http://www.w3.org/2005/08/addressing">
+                        <wsa:Action>CWPMessageToCWP</wsa:Action>
+                    </soapenv:Header>
+                <soapenv:Body>
+                    <mes:MessageToCWPResponse xmlns:mes="http://hhstp.ms.gov/hhstp/MessageToCWP" xmlns:ns="http://hhstp.ms.gov/hhstp/hhstp-core/1.0">
+                        <ns:ResponseCode>500</ns:ResponseCode>
+                        <ns:ResponseDescription>Unable to process Message</ns:ResponseDescription>
+                        <ns:ResponseTimeStamp>${nDate}</ns:ResponseTimeStamp>
+                    </mes:MessageToCWPResponse>
+                </soapenv:Body>
+            </soapenv:Envelope>`
+    
+    await res.contentType("application/xml");
+    await res.send(resultXML)
+  }
+}
+
+export default publishMessageToCWP
+
+var redis = require("redis");
+import { config } from '../config/main';
+
+var auditCacheConnection: any = null;
+try {
+} catch (error) {
+    // console.log("Redis error", error);
+    auditCacheConnection = null
+}
+
+
+module.exports = { auditCacheConnection }
+// module.exports =  mycache;
