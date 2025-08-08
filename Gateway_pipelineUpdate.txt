@@ -1,0 +1,37 @@
+pipeline {
+    agent any
+    
+    triggers {
+        cron('*/5 * * * *')
+    }
+
+    stages {
+        stage('Login') {
+            steps {
+                withCredentials([azureServicePrincipal('MS_SP_Azure')]) {
+                  // Log in to Azure
+                  sh '''
+                    az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID
+                    az account set -s $AZURE_SUBSCRIPTION_ID
+                  '''
+                }
+            }
+        }
+        stage('Update') {
+            steps {
+                  sh '''
+                    fqdn=$(az network application-gateway address-pool show --gateway-name sna-mssp-sit-appgw01 -g sna-mssp-s-rg1e2 -n defaultaddresspool --query backendAddresses[0].fqdn)
+                    #if [ -z "$fqdn" ]
+                    if [ "$fqdn" = "" ];
+                    then
+                    	az network application-gateway address-pool update -g sna-mssp-s-rg1e2 --gateway-name sna-mssp-sit-appgw01 -n defaultaddresspool --add backendAddresses fqdn=api.cssp.portal.conduent.com
+                    
+                    	az network application-gateway probe update -g sna-mssp-s-rg1e2 --gateway-name sna-mssp-sit-appgw01 -n defaultprobe-Https --host api.cssp.portal.conduent.com --path /status-0123456789abcdef --port 443
+                    
+                    	az network application-gateway probe update -g sna-mssp-s-rg1e2 --gateway-name sna-mssp-sit-appgw01 -n pb-default-node-service-443-ssp-ingress --path /nodebackend/
+                    fi
+                  '''
+            }
+        }
+    }
+}
